@@ -1,0 +1,13 @@
+{
+  "name": "chatgpt-bring-back-date-grouping",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "inspect:sidebar": "node ./tools/inspect-chatgpt-sidebar.mjs",
+    "verify:grouping": "node ./tools/verify-date-grouping.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.58.2"
+  }
+}
