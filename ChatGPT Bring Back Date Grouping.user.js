@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        ChatGPT bring back date grouping
-// @version     2.5.3
+// @version     2.5.4
 // @author      tiramifue
 // @description Brings back the date grouping on chatgpt.com
 // @match       https://chatgpt.com/*
@@ -13,16 +13,20 @@
 // @updateURL https://update.greasyfork.org/scripts/538829/ChatGPT%20bring%20back%20date%20grouping.meta.js
 // ==/UserScript==
 
-// updated 2026-03-27
+// updated 2026-05-09
 
 (function () {
     'use strict';
 
-    // 这些选择器对应 2026-03 的新版 ChatGPT 侧栏结构。
+    // 这些选择器对应 2026-05 的新版 ChatGPT 侧栏结构。
     const HISTORY_ROOT_SELECTOR = '#history';
-    const CONVERSATION_SELECTOR = 'a[href^="/c/"]';
+    const CONVERSATION_SELECTOR = 'a[data-sidebar-item][href*="/c/"], a[href^="/c/"], a[href^="https://chatgpt.com/c/"]';
     const HEADER_SELECTOR = '.__chat-group-header';
-    const HISTORY_CACHE_SUFFIX = '/conversation-history';
+    const HISTORY_CACHE_NAME = 'conversation-history';
+    const RENDER_DELAY_MS = 120;
+    const CACHE_POLL_INTERVAL_MS = 1000;
+    const API_PAGE_LIMIT = 50;
+    const API_FETCH_COOLDOWN_MS = 5000;
 
     GM_addStyle(`
 .__chat-group-header {
@@ -77,8 +81,101 @@
         if (!(node instanceof HTMLAnchorElement)) return null;
 
         const href = node.getAttribute('href') || '';
-        const match = href.match(/^\/c\/([^/?#]+)/);
+        const match = href.match(/(?:^|https:\/\/chatgpt\.com)\/c\/([^/?#]+)/);
         return match ? match[1] : null;
+    }
+
+    /**
+     * 判断 localStorage 键是否是 ChatGPT 的会话历史缓存。
+     * 新版页面会在键名前拼接 user/workspace，因此不能只比较完整键名。
+     * @param {string} storageKey 缓存键
+     * @returns {boolean} 是否为会话历史缓存
+     */
+    function isConversationHistoryCacheKey(storageKey) {
+        return storageKey === HISTORY_CACHE_NAME || storageKey.endsWith(`/${HISTORY_CACHE_NAME}`);
+    }
+
+    /**
+     * 计算字符串的轻量稳定哈希，用于判断缓存内容是否实际变化。
+     * @param {string} value 原始字符串
+     * @returns {string} 36 进制哈希
+     */
+    function hashString(value) {
+        let hash = 2166136261;
+        for (let index = 0; index < value.length; index += 1) {
+            hash ^= value.charCodeAt(index);
+            hash = Math.imul(hash, 16777619);
+        }
+        return (hash >>> 0).toString(36);
+    }
+
+    /**
+     * 为所有会话历史缓存生成内容签名。
+     * Tampermonkey 沙盒未必能拦截页面主上下文的 setItem，因此需要用签名轮询补齐更新通知。
+     * @returns {string} 当前历史缓存签名
+     */
+    function buildHistoryCacheSignature() {
+        const signatures = [];
+
+        for (let index = 0; index < localStorage.length; index += 1) {
+            const storageKey = localStorage.key(index);
+            if (!storageKey || !isConversationHistoryCacheKey(storageKey)) continue;
+
+            const rawValue = localStorage.getItem(storageKey) || '';
+            signatures.push(`${storageKey}:${rawValue.length}:${hashString(rawValue)}`);
+        }
+
+        return signatures.sort().join('|');
+    }
+
+    /**
+     * 从 TanStack Query 风格的分页缓存中提取分页数组。
+     * 这里只接受明确的 pages/items 结构，避免把无关缓存误当成会话列表。
+     * @param {object} payload 解析后的缓存对象
+     * @returns {Array<object>} 分页数组
+     */
+    function getHistoryPages(payload) {
+        if (Array.isArray(payload?.value?.pages)) return payload.value.pages;
+        if (Array.isArray(payload?.pages)) return payload.pages;
+        return [];
+    }
+
+    /**
+     * 从分页或扁平缓存中提取会话条目。
+     * @param {object} payload 解析后的缓存对象
+     * @returns {Array<object>} 历史会话数组
+     */
+    function getHistoryItems(payload) {
+        const pages = getHistoryPages(payload);
+        if (pages.length > 0) {
+            return pages.flatMap(page => Array.isArray(page?.items) ? page.items : []);
+        }
+
+        if (Array.isArray(payload?.value?.items)) return payload.value.items;
+        if (Array.isArray(payload?.items)) return payload.items;
+        return [];
+    }
+
+    /**
+     * 将会话条目写入索引。
+     * 同一个会话出现多次时，始终保留更新时间最新的版本。
+     * @param {Map<string, object>} conversationIndex 对话索引
+     * @param {object} item 会话条目
+     */
+    function upsertConversationIndex(conversationIndex, item) {
+        if (!item?.id || !item?.update_time || item?.is_archived) return;
+
+        const previous = conversationIndex.get(item.id);
+        if (!previous) {
+            conversationIndex.set(item.id, item);
+            return;
+        }
+
+        const previousTime = new Date(previous.update_time).getTime();
+        const nextTime = new Date(item.update_time).getTime();
+        if (nextTime > previousTime) {
+            conversationIndex.set(item.id, item);
+        }
     }
 
     /**
@@ -92,8 +189,7 @@
 
         try {
             const payload = JSON.parse(rawValue);
-            const pages = Array.isArray(payload?.value?.pages) ? payload.value.pages : [];
-            return pages.flatMap(page => Array.isArray(page?.items) ? page.items : []);
+            return getHistoryItems(payload);
         } catch (error) {
             console.warn('ChatGPT grouping: failed to parse conversation history cache.', error);
             return [];
@@ -106,31 +202,96 @@
      * @returns {Map<string, object>} 对话元数据索引
      */
     function loadConversationIndex() {
-        const conversationIndex = new Map();
+        const conversationIndex = new Map(apiConversationIndex);
 
         for (let index = 0; index < localStorage.length; index += 1) {
             const storageKey = localStorage.key(index);
-            if (!storageKey || !storageKey.endsWith(HISTORY_CACHE_SUFFIX)) continue;
+            if (!storageKey || !isConversationHistoryCacheKey(storageKey)) continue;
 
             const items = parseConversationHistoryEntry(localStorage.getItem(storageKey));
             for (const item of items) {
-                if (!item?.id || !item?.update_time || item?.is_archived) continue;
-
-                const previous = conversationIndex.get(item.id);
-                if (!previous) {
-                    conversationIndex.set(item.id, item);
-                    continue;
-                }
-
-                const previousTime = new Date(previous.update_time).getTime();
-                const nextTime = new Date(item.update_time).getTime();
-                if (nextTime > previousTime) {
-                    conversationIndex.set(item.id, item);
-                }
+                upsertConversationIndex(conversationIndex, item);
             }
         }
 
         return conversationIndex;
+    }
+
+    const apiConversationIndex = new Map();
+    let apiFetchInFlight = false;
+    let lastApiFetchTime = 0;
+    let lastApiFetchSignature = '';
+
+    /**
+     * 从 ChatGPT 历史接口补齐可见会话的元数据。
+     * 这不是猜测分组，而是在 localStorage 缓存尚未落地时读取同源的权威历史列表。
+     * @param {Array<string>} missingConversationIds 当前可见但缺少时间信息的会话 ID
+     */
+    async function fetchMissingConversationMetadata(missingConversationIds) {
+        const targetIds = new Set(missingConversationIds.filter(id => id && !apiConversationIndex.has(id)));
+        if (targetIds.size === 0) return;
+
+        let offset = 0;
+        let total = Infinity;
+        let hasNewMetadata = false;
+
+        while (targetIds.size > 0 && offset < total) {
+            const apiUrl = new URL('/backend-api/conversations', location.origin);
+            apiUrl.searchParams.set('offset', String(offset));
+            apiUrl.searchParams.set('limit', String(API_PAGE_LIMIT));
+            apiUrl.searchParams.set('order', 'updated');
+            apiUrl.searchParams.set('is_archived', 'false');
+            apiUrl.searchParams.set('is_starred', 'false');
+
+            const response = await fetch(apiUrl.toString(), {
+                credentials: 'include'
+            });
+            if (!response.ok) {
+                throw new Error(`history api returned ${response.status}`);
+            }
+
+            const payload = await response.json();
+            const items = Array.isArray(payload?.items) ? payload.items : [];
+            total = Number.isFinite(payload?.total) ? payload.total : offset + items.length;
+
+            for (const item of items) {
+                const before = apiConversationIndex.get(item?.id);
+                upsertConversationIndex(apiConversationIndex, item);
+                const after = apiConversationIndex.get(item?.id);
+                if (after && after !== before) hasNewMetadata = true;
+                if (item?.id) targetIds.delete(item.id);
+            }
+
+            if (items.length < API_PAGE_LIMIT) break;
+            offset += API_PAGE_LIMIT;
+        }
+
+        if (hasNewMetadata) queueRender();
+    }
+
+    /**
+     * 触发缺失元数据的接口补齐，并对失败请求做短暂冷却，避免网络异常时连续打接口。
+     * @param {Array<string>} missingConversationIds 当前可见但缺少时间信息的会话 ID
+     */
+    function requestMissingConversationMetadata(missingConversationIds) {
+        const uniqueIds = [...new Set(missingConversationIds)].filter(id => id && !apiConversationIndex.has(id));
+        if (uniqueIds.length === 0 || apiFetchInFlight) return;
+
+        const signature = uniqueIds.sort().join('|');
+        const now = Date.now();
+        if (signature === lastApiFetchSignature && now - lastApiFetchTime < API_FETCH_COOLDOWN_MS) return;
+
+        apiFetchInFlight = true;
+        lastApiFetchTime = now;
+        lastApiFetchSignature = signature;
+
+        fetchMissingConversationMetadata(uniqueIds)
+            .catch(error => {
+                console.warn('ChatGPT grouping: failed to fetch conversation metadata.', error);
+            })
+            .finally(() => {
+                apiFetchInFlight = false;
+            });
     }
 
     /**
@@ -197,46 +358,56 @@
         return header;
     }
 
+    let isRendering = false;
+
     /**
      * 按当前 DOM 顺序重建分组头。
      * 新版页面已经负责排序，我们只需要根据缓存中的 `update_time` 决定组边界。
      * @param {HTMLElement} historyRoot 历史根节点
      */
     function renderGroupedChats(historyRoot) {
-        const observer = historyRoot.__chatObserver;
-        if (observer) observer.disconnect();
+        if (!(historyRoot instanceof HTMLElement) || isRendering) return;
 
-        clearGroupedChats(historyRoot);
+        isRendering = true;
 
-        const container = getRenderableHistoryContainer(historyRoot);
-        if (!(container instanceof HTMLElement)) {
-            if (observer) observer.observe(historyRoot, { childList: true, subtree: true });
-            return;
-        }
+        try {
+            clearGroupedChats(historyRoot);
 
-        syncGroupHeaderPadding(historyRoot, container);
+            const container = getRenderableHistoryContainer(historyRoot);
+            if (!(container instanceof HTMLElement)) return;
 
-        const conversationIndex = loadConversationIndex();
-        let lastLabel = null;
+            syncGroupHeaderPadding(historyRoot, container);
 
-        container.querySelectorAll(CONVERSATION_SELECTOR).forEach(node => {
-            const conversationId = getConversationIdFromNode(node);
-            const conversation = conversationId ? conversationIndex.get(conversationId) : null;
-            const label = getDateGroupLabel(conversation?.update_time || null);
+            const conversationIndex = loadConversationIndex();
+            let lastLabel = null;
+            const missingConversationIds = [];
 
-            // 如果当前条目在缓存里还没有时间信息，就直接跳过，不做猜测性分组。
-            if (!label) return;
+            container.querySelectorAll(CONVERSATION_SELECTOR).forEach(node => {
+                const conversationId = getConversationIdFromNode(node);
+                const conversation = conversationId ? conversationIndex.get(conversationId) : null;
+                const label = getDateGroupLabel(conversation?.update_time || null);
 
-            if (label !== lastLabel) {
-                const row = getConversationRow(node);
-                if (row.parentNode) {
-                    row.parentNode.insertBefore(createGroupHeader(container, label), row);
-                    lastLabel = label;
+                // 如果当前条目在缓存里还没有时间信息，就直接跳过，不做猜测性分组。
+                if (!label) {
+                    if (conversationId) missingConversationIds.push(conversationId);
+                    return;
                 }
-            }
-        });
 
-        if (observer) observer.observe(historyRoot, { childList: true, subtree: true });
+                if (label !== lastLabel) {
+                    const row = getConversationRow(node);
+                    if (row.parentNode) {
+                        row.parentNode.insertBefore(createGroupHeader(container, label), row);
+                        lastLabel = label;
+                    }
+                }
+            });
+
+            if (missingConversationIds.length > 0) {
+                requestMissingConversationMetadata(missingConversationIds);
+            }
+        } finally {
+            isRendering = false;
+        }
     }
 
     let renderTimer = null;
@@ -247,12 +418,28 @@
     function queueRender() {
         if (renderTimer) clearTimeout(renderTimer);
         renderTimer = setTimeout(() => {
+            renderTimer = null;
             const historyRoot = document.querySelector(HISTORY_ROOT_SELECTOR);
             if (historyRoot instanceof HTMLElement) {
                 renderGroupedChats(historyRoot);
             }
-        }, 120);
+        }, RENDER_DELAY_MS);
     }
+
+    /**
+     * 判断一次 DOM 变更是否只来自脚本自己的分组头。
+     * 这样可以避免插入/删除分组头反过来触发无限重渲染。
+     * @param {MutationRecord} mutation DOM 变更记录
+     * @returns {boolean} 是否只包含脚本自身的节点
+     */
+    function isOwnHeaderMutation(mutation) {
+        const changedNodes = [...mutation.addedNodes, ...mutation.removedNodes];
+        return changedNodes.length > 0 && changedNodes.every(node => (
+            node instanceof HTMLElement && node.matches(HEADER_SELECTOR)
+        ));
+    }
+
+    let activeHistoryObserver = null;
 
     /**
      * 监听历史列表的节点变化。
@@ -260,12 +447,18 @@
      * @param {HTMLElement} historyRoot 历史根节点
      */
     function observeChatList(historyRoot) {
-        const observer = new MutationObserver(() => {
+        if (activeHistoryObserver) {
+            activeHistoryObserver.disconnect();
+            activeHistoryObserver = null;
+        }
+
+        const observer = new MutationObserver(mutations => {
+            if (isRendering || mutations.every(isOwnHeaderMutation)) return;
             queueRender();
         });
 
         observer.observe(historyRoot, { childList: true, subtree: true });
-        historyRoot.__chatObserver = observer;
+        activeHistoryObserver = observer;
     }
 
     /**
@@ -274,7 +467,7 @@
      */
     function installHistoryCacheListeners() {
         window.addEventListener('storage', event => {
-            if (typeof event.key === 'string' && event.key.endsWith(HISTORY_CACHE_SUFFIX)) {
+            if (typeof event.key === 'string' && isConversationHistoryCacheKey(event.key)) {
                 queueRender();
             }
         });
@@ -286,7 +479,7 @@
 
         Storage.prototype.setItem = function (key, value) {
             const result = originalSetItem.apply(this, arguments);
-            if (this === localStorage && typeof key === 'string' && key.endsWith(HISTORY_CACHE_SUFFIX)) {
+            if (this === localStorage && typeof key === 'string' && isConversationHistoryCacheKey(key)) {
                 queueRender();
             }
             return result;
@@ -294,13 +487,49 @@
 
         Storage.prototype.removeItem = function (key) {
             const result = originalRemoveItem.apply(this, arguments);
-            if (this === localStorage && typeof key === 'string' && key.endsWith(HISTORY_CACHE_SUFFIX)) {
+            if (this === localStorage && typeof key === 'string' && isConversationHistoryCacheKey(key)) {
                 queueRender();
             }
             return result;
         };
 
         Storage.prototype.__chatGroupingPatched = true;
+    }
+
+    /**
+     * 低频检查历史缓存是否变化。
+     * 这条链路专门覆盖 Tampermonkey 沙盒无法拦截页面写缓存的情况。
+     */
+    function startHistoryCachePolling() {
+        let lastSignature = buildHistoryCacheSignature();
+
+        function checkHistoryCache() {
+            if (document.hidden) return;
+
+            const nextSignature = buildHistoryCacheSignature();
+            if (nextSignature === lastSignature) return;
+
+            lastSignature = nextSignature;
+            queueRender();
+        }
+
+        window.setTimeout(checkHistoryCache, Math.floor(CACHE_POLL_INTERVAL_MS / 2));
+        window.setInterval(checkHistoryCache, CACHE_POLL_INTERVAL_MS);
+    }
+
+    /**
+     * 安排下一次本地日期变化后的刷新。
+     * `今天/昨天/几天前` 这些标签不依赖 DOM 变化，跨过午夜后必须主动重算。
+     */
+    function scheduleMidnightRefresh() {
+        const now = new Date();
+        const nextDay = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 2);
+        const delay = Math.max(1000, nextDay.getTime() - now.getTime());
+
+        window.setTimeout(() => {
+            queueRender();
+            scheduleMidnightRefresh();
+        }, delay);
     }
 
     /**
@@ -320,16 +549,24 @@
         }
 
         installHistoryCacheListeners();
+        startHistoryCachePolling();
+        scheduleMidnightRefresh();
 
         const rootObserver = new MutationObserver(() => {
             const historyRoot = document.querySelector(HISTORY_ROOT_SELECTOR);
             if (historyRoot instanceof HTMLElement) {
                 setup(historyRoot);
-                queueRender();
             }
         });
 
         rootObserver.observe(document.body, { childList: true, subtree: true });
+
+        // 页面从 bfcache 恢复、标签页重新可见或窗口重新聚焦时，补一次轻量刷新。
+        window.addEventListener('pageshow', queueRender);
+        window.addEventListener('focus', queueRender);
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) queueRender();
+        });
 
         const historyRootNow = document.querySelector(HISTORY_ROOT_SELECTOR);
         if (historyRootNow instanceof HTMLElement) {
