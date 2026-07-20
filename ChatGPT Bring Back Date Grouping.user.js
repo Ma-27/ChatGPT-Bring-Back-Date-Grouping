@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        ChatGPT bring back date grouping
-// @version     2.5.4
+// @version     2.5.5
 // @author      tiramifue
 // @description Brings back the date grouping on chatgpt.com
 // @match       https://chatgpt.com/*
@@ -13,7 +13,7 @@
 // @updateURL https://update.greasyfork.org/scripts/538829/ChatGPT%20bring%20back%20date%20grouping.meta.js
 // ==/UserScript==
 
-// updated 2026-05-09
+// updated 2026-07-20
 
 (function () {
     'use strict';
@@ -23,10 +23,8 @@
     const CONVERSATION_SELECTOR = 'a[data-sidebar-item][href*="/c/"], a[href^="/c/"], a[href^="https://chatgpt.com/c/"]';
     const HEADER_SELECTOR = '.__chat-group-header';
     const HISTORY_CACHE_NAME = 'conversation-history';
-    const RENDER_DELAY_MS = 120;
     const CACHE_POLL_INTERVAL_MS = 1000;
     const API_PAGE_LIMIT = 50;
-    const API_FETCH_COOLDOWN_MS = 5000;
 
     GM_addStyle(`
 .__chat-group-header {
@@ -199,43 +197,75 @@
     /**
      * 汇总所有可见 workspace/account 的历史缓存，并按对话 ID 建索引。
      * 如果同一个对话在多个缓存中出现，则保留更新时间更晚的版本。
-     * @returns {Map<string, object>} 对话元数据索引
+     * @returns {{conversationIndex: Map<string, object>, cacheRevision: string}} 对话索引和缓存版本
      */
     function loadConversationIndex() {
         const conversationIndex = new Map(apiConversationIndex);
+        const cacheSignatures = [];
 
         for (let index = 0; index < localStorage.length; index += 1) {
             const storageKey = localStorage.key(index);
             if (!storageKey || !isConversationHistoryCacheKey(storageKey)) continue;
 
-            const items = parseConversationHistoryEntry(localStorage.getItem(storageKey));
+            const rawValue = localStorage.getItem(storageKey) || '';
+            cacheSignatures.push(`${storageKey}:${rawValue.length}:${hashString(rawValue)}`);
+
+            const items = parseConversationHistoryEntry(rawValue);
             for (const item of items) {
                 upsertConversationIndex(conversationIndex, item);
             }
         }
 
-        return conversationIndex;
+        return {
+            conversationIndex,
+            cacheRevision: cacheSignatures.sort().join('|')
+        };
     }
 
     const apiConversationIndex = new Map();
     let apiFetchInFlight = false;
-    let lastApiFetchTime = 0;
-    let lastApiFetchSignature = '';
+    let activeApiCatalogState = null;
+
+    /**
+     * 为一个明确的历史缓存版本创建 API 目录扫描状态。
+     * 已读取的分页和已尝试的缺失 ID 都只属于这个版本，缓存变化后重新建状态。
+     * @param {string} cacheRevision 历史缓存版本
+     * @returns {object} API 目录扫描状态
+     */
+    function createApiCatalogState(cacheRevision) {
+        return {
+            cacheRevision,
+            nextOffset: 0,
+            total: Infinity,
+            exhausted: false,
+            attemptedConversationIds: new Set(),
+            pendingConversationIds: new Set()
+        };
+    }
+
+    /**
+     * 获取当前缓存版本对应的 API 目录扫描状态。
+     * @param {string} cacheRevision 历史缓存版本
+     * @returns {object} API 目录扫描状态
+     */
+    function getApiCatalogState(cacheRevision) {
+        if (!activeApiCatalogState || activeApiCatalogState.cacheRevision !== cacheRevision) {
+            activeApiCatalogState = createApiCatalogState(cacheRevision);
+        }
+        return activeApiCatalogState;
+    }
 
     /**
      * 从 ChatGPT 历史接口补齐可见会话的元数据。
-     * 这不是猜测分组，而是在 localStorage 缓存尚未落地时读取同源的权威历史列表。
-     * @param {Array<string>} missingConversationIds 当前可见但缺少时间信息的会话 ID
+     * 同一个缓存版本始终从上次成功读取的 offset 继续，绝不重复扫描已经读取的分页。
+     * @param {Set<string>} targetIds 当前可见但缺少时间信息的会话 ID
+     * @param {object} catalogState 当前缓存版本的 API 目录扫描状态
      */
-    async function fetchMissingConversationMetadata(missingConversationIds) {
-        const targetIds = new Set(missingConversationIds.filter(id => id && !apiConversationIndex.has(id)));
-        if (targetIds.size === 0) return;
-
-        let offset = 0;
-        let total = Infinity;
+    async function fetchMissingConversationMetadata(targetIds, catalogState) {
         let hasNewMetadata = false;
 
-        while (targetIds.size > 0 && offset < total) {
+        while (targetIds.size > 0 && !catalogState.exhausted) {
+            const offset = catalogState.nextOffset;
             const apiUrl = new URL('/backend-api/conversations', location.origin);
             apiUrl.searchParams.set('offset', String(offset));
             apiUrl.searchParams.set('limit', String(API_PAGE_LIMIT));
@@ -252,7 +282,9 @@
 
             const payload = await response.json();
             const items = Array.isArray(payload?.items) ? payload.items : [];
-            total = Number.isFinite(payload?.total) ? payload.total : offset + items.length;
+            if (Number.isFinite(payload?.total)) {
+                catalogState.total = payload.total;
+            }
 
             for (const item of items) {
                 const before = apiConversationIndex.get(item?.id);
@@ -262,36 +294,63 @@
                 if (item?.id) targetIds.delete(item.id);
             }
 
-            if (items.length < API_PAGE_LIMIT) break;
-            offset += API_PAGE_LIMIT;
+            // 只有成功解析当前页后才推进游标，网络失败时不会跳过尚未读取的数据。
+            catalogState.nextOffset = offset + items.length;
+            catalogState.exhausted = items.length === 0 || catalogState.nextOffset >= catalogState.total;
         }
 
         if (hasNewMetadata) queueRender();
     }
 
     /**
-     * 触发缺失元数据的接口补齐，并对失败请求做短暂冷却，避免网络异常时连续打接口。
-     * @param {Array<string>} missingConversationIds 当前可见但缺少时间信息的会话 ID
+     * 依次处理当前缓存版本中尚未补齐的会话 ID。
+     * 新请求会先进入集合排重；已有请求结束后，再处理期间新增的 ID。
      */
-    function requestMissingConversationMetadata(missingConversationIds) {
-        const uniqueIds = [...new Set(missingConversationIds)].filter(id => id && !apiConversationIndex.has(id));
-        if (uniqueIds.length === 0 || apiFetchInFlight) return;
+    function processPendingConversationMetadata() {
+        if (apiFetchInFlight || !activeApiCatalogState) return;
 
-        const signature = uniqueIds.sort().join('|');
-        const now = Date.now();
-        if (signature === lastApiFetchSignature && now - lastApiFetchTime < API_FETCH_COOLDOWN_MS) return;
+        const catalogState = activeApiCatalogState;
+        const targetIds = new Set(
+            [...catalogState.pendingConversationIds].filter(id => !apiConversationIndex.has(id))
+        );
+        catalogState.pendingConversationIds.clear();
+
+        if (targetIds.size === 0 || catalogState.exhausted) return;
 
         apiFetchInFlight = true;
-        lastApiFetchTime = now;
-        lastApiFetchSignature = signature;
-
-        fetchMissingConversationMetadata(uniqueIds)
+        fetchMissingConversationMetadata(targetIds, catalogState)
             .catch(error => {
                 console.warn('ChatGPT grouping: failed to fetch conversation metadata.', error);
             })
             .finally(() => {
                 apiFetchInFlight = false;
+                processPendingConversationMetadata();
             });
+    }
+
+    /**
+     * 触发缺失元数据的接口补齐。
+     * 同一个缓存版本中的每个缺失 ID 只允许进入扫描流程一次。
+     * @param {Array<string>} missingConversationIds 当前可见但缺少时间信息的会话 ID
+     * @param {string} cacheRevision 当前历史缓存版本
+     */
+    function requestMissingConversationMetadata(missingConversationIds, cacheRevision) {
+        const catalogState = getApiCatalogState(cacheRevision);
+
+        for (const conversationId of missingConversationIds) {
+            if (
+                !conversationId ||
+                apiConversationIndex.has(conversationId) ||
+                catalogState.attemptedConversationIds.has(conversationId)
+            ) {
+                continue;
+            }
+
+            catalogState.attemptedConversationIds.add(conversationId);
+            catalogState.pendingConversationIds.add(conversationId);
+        }
+
+        processPendingConversationMetadata();
     }
 
     /**
@@ -378,7 +437,7 @@
 
             syncGroupHeaderPadding(historyRoot, container);
 
-            const conversationIndex = loadConversationIndex();
+            const { conversationIndex, cacheRevision } = loadConversationIndex();
             let lastLabel = null;
             const missingConversationIds = [];
 
@@ -403,27 +462,29 @@
             });
 
             if (missingConversationIds.length > 0) {
-                requestMissingConversationMetadata(missingConversationIds);
+                requestMissingConversationMetadata(missingConversationIds, cacheRevision);
             }
         } finally {
             isRendering = false;
         }
     }
 
-    let renderTimer = null;
+    let renderFrameId = null;
 
     /**
-     * 对频繁的 DOM 变化做一次轻量防抖，减少重复重排。
+     * 将同一浏览器帧中的刷新请求合并为一次。
+     * 已安排的任务不会被后续变化重置，因此持续变化也无法无限推迟渲染。
      */
     function queueRender() {
-        if (renderTimer) clearTimeout(renderTimer);
-        renderTimer = setTimeout(() => {
-            renderTimer = null;
+        if (renderFrameId !== null) return;
+
+        renderFrameId = window.requestAnimationFrame(() => {
+            renderFrameId = null;
             const historyRoot = document.querySelector(HISTORY_ROOT_SELECTOR);
             if (historyRoot instanceof HTMLElement) {
                 renderGroupedChats(historyRoot);
             }
-        }, RENDER_DELAY_MS);
+        });
     }
 
     /**

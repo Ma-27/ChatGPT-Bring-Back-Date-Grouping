@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "test": "node --test",
     "inspect:sidebar": "node ./tools/inspect-chatgpt-sidebar.mjs",
     "verify:grouping": "node ./tools/verify-date-grouping.mjs"
   },
