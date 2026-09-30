@@ -9,7 +9,17 @@
 - 当前脚本文件：`ChatGPT Bring Back Date Grouping.user.js`
 - 当前适配目标：新版 `chatgpt.com` 左侧历史栏
 - 当前分组依据：对话 `update_time`
-- 当前验证方式：基于本机浏览器登录态的页面注入验证
+- 当前验证方式：隔离 DOM 自动化回归测试，以及基于本机浏览器登录态的页面注入验证
+
+#### 2026-09-30 侧栏适配（2.5.6）
+
+新版 Web 将历史栏改为“置顶 / 项目 / 最近”。脚本现在通过
+`data-app-action-sidebar-section-heading="Recents"` 定位“最近”区域，
+在其中的 `role="list"` 容器内、完整会话行之前插入日期标题。
+不依赖“最近”的中文文案或构建生成的样式类名，也不会改动置顶、项目和聊天正文。
+
+侧栏重新展开、窄屏弹出侧栏、会话追加或重排时，会重新计算分组；多个已挂载的
+历史区域分别监听，卸载后释放监听器。原有 `#history` 列表仍可使用。
 
 ## 来源与致谢
 
@@ -33,7 +43,7 @@
 - 建立了适合 JetBrains IDE 使用的本地工程目录与 Git 历史
 - 保留了一次“原始导入”提交，方便后续追踪差异
 - 将脚本从依赖 React Fiber 私有字段的实现，改为读取页面自身的历史缓存
-- 适配了新版 ChatGPT 侧栏的 `#history > ul > li > a` 结构
+- 适配了新版 ChatGPT 侧栏的 `Recents` 区域及其中的完整会话行，保留原有 `#history` 列表支持
 - 增加了本地调试与验证脚本，便于在页面再次改版后快速定位问题
 
 ## 工作原理
@@ -55,11 +65,13 @@
 
 1. 安装一个 userscript 管理器，例如 Tampermonkey。
 2. 打开仓库中的 `ChatGPT Bring Back Date Grouping.user.js`。
-3. 将脚本内容粘贴到 Tampermonkey，新建脚本后保存。
+3. 将脚本内容粘贴到 Tampermonkey 并保存；已安装旧版时，替换原脚本内容，避免同时启用两份。
 4. 打开或刷新 `https://chatgpt.com/`。
 5. 展开左侧历史栏，检查日期分组是否正常显示。
 
 ## 开发与验证
+
+开发环境使用 Node.js 24 或更高版本，先执行 `npm ci` 安装依赖；安装 userscript 本身不需要 Node.js。
 
 本仓库额外提供了几个本地调试脚本：
 
@@ -68,11 +80,12 @@
 - `npm run verify:grouping`
   用于把当前 userscript 注入浏览器页面，并验证日期分组是否已经恢复。
 - `npm test`
-  用于验证刷新请求按帧合并、API 分页游标复用和失败请求排重。
+  使用隔离 DOM 验证新版侧栏分组、区域隔离、动态增删重排、侧栏重建及缓存更新；
+  同时验证刷新请求按帧合并、API 分页游标复用和失败请求排重。
 
 说明：
 
-- 这些脚本依赖本机已登录的 Chrome 环境。
+- `inspect:sidebar` 和 `verify:grouping` 依赖本机已登录的 Chrome 环境；`npm test` 不需要浏览器登录态或网络。
 - 产物会输出到 `artifacts/` 目录。
 - `artifacts/` 已加入 `.gitignore`，默认不会进入版本库。
 
@@ -84,6 +97,10 @@
   抓取侧栏结构与缓存信息的调试脚本
 - `tools/verify-date-grouping.mjs`
   注入并验证分组效果的验证脚本
+- `tools/sidebar-dom.mjs`
+  两个调试入口共用的侧栏定位与展开逻辑
+- `tests/sidebar-dom.test.mjs`
+  根据实际页面层级编写的 DOM 回归测试（使用虚构会话，不需要登录态）
 - `tools/export_chatgpt_cookies.py`
   读取本机 Chrome 中 ChatGPT cookie 的辅助脚本
 - `tools/export_recent_chat_url.py`

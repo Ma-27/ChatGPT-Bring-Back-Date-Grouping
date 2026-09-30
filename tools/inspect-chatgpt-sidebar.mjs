@@ -8,6 +8,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { chromium } from 'playwright-core';
+import { HISTORY_ROOT_SELECTOR, HISTORY_LINK_SELECTOR, openSidebarAndWait } from './sidebar-dom.mjs';
 
 const execFileAsync = promisify(execFile);
 const PROJECT_DIR = path.resolve(import.meta.dirname, '..');
@@ -46,10 +47,10 @@ async function loadRecentChatUrl() {
  * @returns {Promise<object>} 侧栏诊断信息
  */
 async function extractSidebarSnapshot(page) {
-  return page.evaluate(async () => {
-    const historyRoot = document.querySelector('#history');
+  return page.evaluate(async ({ rootSelector, linkSelector }) => {
+    const historyRoot = document.querySelector(rootSelector);
     const sidebar = historyRoot?.closest('nav, aside, [data-sidebar], [data-testid], [role="navigation"]') ?? null;
-    const conversationAnchors = [...document.querySelectorAll('a[href^="/c/"]')];
+    const conversationAnchors = [...document.querySelectorAll(linkSelector)];
     const localStorageEntries = (() => {
       const entries = [];
       for (let index = 0; index < localStorage.length; index += 1) {
@@ -195,44 +196,7 @@ async function extractSidebarSnapshot(page) {
       reactDebug,
       localStorageEntries
     };
-  });
-}
-
-/**
- * 在页面中轮询等待历史列表出现。
- * 这里不依赖单次时序，尽量等到新版边栏真正完成挂载。
- * @param {import('playwright-core').Page} page 页面对象
- */
-async function waitForHistoryList(page) {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    const hasHistoryItems = await page.evaluate(() => {
-      return Boolean(document.querySelector('#history a[href^="/c/"]'));
-    });
-    if (hasHistoryItems) {
-      return;
-    }
-    await page.waitForTimeout(500);
-  }
-}
-
-/**
- * 尝试展开新版侧边栏并等待历史列表挂载。
- * @param {import('playwright-core').Page} page 页面对象
- */
-async function openSidebarAndWait(page) {
-  const hasOpenSidebarButton = await page
-    .locator('button[aria-label="打开边栏"], button[aria-label="Open sidebar"]')
-    .count();
-  if (hasOpenSidebarButton > 0) {
-    await page.evaluate(() => {
-      const trigger = document.querySelector('button[aria-label="打开边栏"], button[aria-label="Open sidebar"]');
-      if (trigger instanceof HTMLButtonElement) {
-        trigger.click();
-      }
-    });
-    await page.waitForTimeout(3000);
-  }
-  await waitForHistoryList(page);
+  }, { rootSelector: HISTORY_ROOT_SELECTOR, linkSelector: HISTORY_LINK_SELECTOR });
 }
 
 async function main() {

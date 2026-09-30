@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        ChatGPT bring back date grouping
-// @version     2.5.5
+// @version     2.5.6
 // @author      tiramifue
 // @description Brings back the date grouping on chatgpt.com
 // @match       https://chatgpt.com/*
@@ -13,13 +13,13 @@
 // @updateURL https://update.greasyfork.org/scripts/538829/ChatGPT%20bring%20back%20date%20grouping.meta.js
 // ==/UserScript==
 
-// updated 2026-07-20
+// updated 2026-09-30
 
 (function () {
     'use strict';
 
-    // 这些选择器对应 2026-05 的新版 ChatGPT 侧栏结构。
-    const HISTORY_ROOT_SELECTOR = '#history';
+    // 2026-09 侧栏使用独立的 Recents 区域；按语义属性定位，不依赖语言或样式类名。
+    const HISTORY_ROOT_SELECTOR = '#history, [data-app-action-sidebar-section-heading="Recents"]';
     const CONVERSATION_SELECTOR = 'a[data-sidebar-item][href*="/c/"], a[href^="/c/"], a[href^="https://chatgpt.com/c/"]';
     const HEADER_SELECTOR = '.__chat-group-header';
     const HISTORY_CACHE_NAME = 'conversation-history';
@@ -355,23 +355,28 @@
 
     /**
      * 获取新版历史列表真正承载条目的容器。
-     * 目前 `#history` 下方是一个 `ul`，但这里保留轻量兼容写法。
+     * Recents 使用 role=list，原有 #history 使用 ul；不把整个侧栏作为列表。
      * @param {HTMLElement} historyRoot 历史根节点
      * @returns {HTMLElement|null} 可渲染分组头的容器
      */
     function getRenderableHistoryContainer(historyRoot) {
         if (!(historyRoot instanceof HTMLElement)) return null;
-        return historyRoot.querySelector('ul') || historyRoot;
+        return historyRoot.querySelector('[role="list"], ul, ol');
     }
 
     /**
      * 获取应当插入分组头之前的“行”节点。
-     * 新版结构中对话链接位于 `li > a`，因此优先回退到 `li`。
+     * 新版链接外还有标题、按钮和动画容器，必须定位到列表的直接子节点。
      * @param {Element} node 对话链接节点
-     * @returns {Element} 作为插入锚点的行节点
+     * @param {HTMLElement} container 历史列表容器
+     * @returns {Element|null} 作为插入锚点的行节点
      */
-    function getConversationRow(node) {
-        return node.closest('li') || node;
+    function getConversationRow(node, container) {
+        let row = node;
+        while (row && row.parentElement !== container) {
+            row = row.parentElement;
+        }
+        return row;
     }
 
     /**
@@ -392,7 +397,7 @@
         const firstAnchor = historyRoot.querySelector(CONVERSATION_SELECTOR);
         if (!(firstAnchor instanceof HTMLElement)) return;
 
-        const titleElement = firstAnchor.querySelector('span[dir="auto"], .truncate, span') || firstAnchor;
+        const titleElement = firstAnchor.querySelector('[data-thread-title], span[dir="auto"], .truncate, span') || firstAnchor;
         if (!(titleElement instanceof HTMLElement)) return;
 
         const titleRect = titleElement.getBoundingClientRect();
@@ -403,13 +408,13 @@
 
     /**
      * 创建分组头节点。
-     * 当容器是 `ul` 时使用 `li`，避免破坏列表结构。
+     * 当容器是原生列表时使用 li，role=list 容器使用 div。
      * @param {HTMLElement} container 分组头容器
      * @param {string} label 分组文案
      * @returns {HTMLElement} 分组头节点
      */
     function createGroupHeader(container, label) {
-        const tagName = container.tagName === 'UL' ? 'li' : 'div';
+        const tagName = ['UL', 'OL'].includes(container.tagName) ? 'li' : 'div';
         const header = document.createElement(tagName);
         header.className = '__chat-group-header';
         header.textContent = label;
@@ -449,12 +454,14 @@
                 // 如果当前条目在缓存里还没有时间信息，就直接跳过，不做猜测性分组。
                 if (!label) {
                     if (conversationId) missingConversationIds.push(conversationId);
+                    // 未知时间会中断分组，后续已知会话必须重新标明日期边界。
+                    lastLabel = null;
                     return;
                 }
 
                 if (label !== lastLabel) {
-                    const row = getConversationRow(node);
-                    if (row.parentNode) {
+                    const row = getConversationRow(node, container);
+                    if (row) {
                         row.parentNode.insertBefore(createGroupHeader(container, label), row);
                         lastLabel = label;
                     }
@@ -480,10 +487,10 @@
 
         renderFrameId = window.requestAnimationFrame(() => {
             renderFrameId = null;
-            const historyRoot = document.querySelector(HISTORY_ROOT_SELECTOR);
-            if (historyRoot instanceof HTMLElement) {
+            // 桌面侧栏和窄屏弹出侧栏可能同时挂载，分别处理各自的最近列表。
+            document.querySelectorAll(HISTORY_ROOT_SELECTOR).forEach(historyRoot => {
                 renderGroupedChats(historyRoot);
-            }
+            });
         });
     }
 
@@ -500,26 +507,25 @@
         ));
     }
 
-    let activeHistoryObserver = null;
-
     /**
      * 监听历史列表的节点变化。
      * 新版侧栏展开、搜索、置顶等操作都会触发这里的重渲染。
      * @param {HTMLElement} historyRoot 历史根节点
+     * @returns {MutationObserver} 当前列表的监听器，由侧栏生命周期统一管理
      */
     function observeChatList(historyRoot) {
-        if (activeHistoryObserver) {
-            activeHistoryObserver.disconnect();
-            activeHistoryObserver = null;
-        }
-
         const observer = new MutationObserver(mutations => {
             if (isRendering || mutations.every(isOwnHeaderMutation)) return;
             queueRender();
         });
 
-        observer.observe(historyRoot, { childList: true, subtree: true });
-        activeHistoryObserver = observer;
+        observer.observe(historyRoot, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['href']
+        });
+        return observer;
     }
 
     /**
@@ -595,29 +601,32 @@
 
     /**
      * 持续等待新版侧栏挂载。
-     * 侧栏收起和重新展开时会重建 `#history`，因此这里要长期监听。
+     * 侧栏收起和重新展开时会重建历史区域，因此这里要长期监听并释放已卸载区域。
      */
     (function watchSidebar() {
-        let lastHistoryRoot = null;
+        const historyObservers = new Map();
 
-        function setup(historyRoot) {
-            if (!(historyRoot instanceof HTMLElement) || historyRoot === lastHistoryRoot) return;
-
-            lastHistoryRoot = historyRoot;
-            observeChatList(historyRoot);
-            queueRender();
-            console.log('ChatGPT grouping: sidebar attached.');
+        function setup() {
+            const historyRoots = new Set(document.querySelectorAll(HISTORY_ROOT_SELECTOR));
+            for (const [historyRoot, observer] of historyObservers) {
+                if (historyRoots.has(historyRoot)) continue;
+                observer.disconnect();
+                historyObservers.delete(historyRoot);
+            }
+            for (const historyRoot of historyRoots) {
+                if (historyObservers.has(historyRoot)) continue;
+                historyObservers.set(historyRoot, observeChatList(historyRoot));
+                queueRender();
+                console.log('ChatGPT grouping: sidebar attached.');
+            }
         }
 
         installHistoryCacheListeners();
         startHistoryCachePolling();
         scheduleMidnightRefresh();
 
-        const rootObserver = new MutationObserver(() => {
-            const historyRoot = document.querySelector(HISTORY_ROOT_SELECTOR);
-            if (historyRoot instanceof HTMLElement) {
-                setup(historyRoot);
-            }
+        const rootObserver = new MutationObserver(mutations => {
+            if (!mutations.every(isOwnHeaderMutation)) setup();
         });
 
         rootObserver.observe(document.body, { childList: true, subtree: true });
@@ -629,9 +638,6 @@
             if (!document.hidden) queueRender();
         });
 
-        const historyRootNow = document.querySelector(HISTORY_ROOT_SELECTOR);
-        if (historyRootNow instanceof HTMLElement) {
-            setup(historyRootNow);
-        }
+        setup();
     })();
 })();

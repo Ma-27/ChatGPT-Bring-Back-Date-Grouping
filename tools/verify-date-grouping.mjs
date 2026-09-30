@@ -8,6 +8,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { chromium } from 'playwright-core';
+import { HISTORY_ROOT_SELECTOR, HISTORY_LINK_SELECTOR, openSidebarAndWait } from './sidebar-dom.mjs';
 
 const execFileAsync = promisify(execFile);
 const PROJECT_DIR = path.resolve(import.meta.dirname, '..');
@@ -38,42 +39,6 @@ async function loadRecentChatUrl() {
     maxBuffer: 1024 * 1024
   });
   return stdout.trim();
-}
-
-/**
- * 等待历史列表出现。
- * @param {import('playwright-core').Page} page 页面对象
- */
-async function waitForHistoryList(page) {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    const hasHistoryItems = await page.evaluate(() => {
-      return Boolean(document.querySelector('#history a[href^="/c/"]'));
-    });
-    if (hasHistoryItems) {
-      return;
-    }
-    await page.waitForTimeout(500);
-  }
-}
-
-/**
- * 展开新版侧栏。
- * @param {import('playwright-core').Page} page 页面对象
- */
-async function openSidebarAndWait(page) {
-  const hasOpenSidebarButton = await page
-    .locator('button[aria-label="打开边栏"], button[aria-label="Open sidebar"]')
-    .count();
-  if (hasOpenSidebarButton > 0) {
-    await page.evaluate(() => {
-      const trigger = document.querySelector('button[aria-label="打开边栏"], button[aria-label="Open sidebar"]');
-      if (trigger instanceof HTMLButtonElement) {
-        trigger.click();
-      }
-    });
-  }
-  await page.waitForTimeout(2500);
-  await waitForHistoryList(page);
 }
 
 /**
@@ -118,15 +83,16 @@ async function main() {
     }, userScriptSource);
     await page.waitForTimeout(1500);
 
-    const verification = await page.evaluate(() => {
-      const headers = [...document.querySelectorAll('#history .__chat-group-header')].map(node => node.textContent?.trim() ?? '');
-      const anchors = [...document.querySelectorAll('#history a[href^="/c/"]')].slice(0, 12).map(node => node.textContent?.trim() ?? '');
+    const verification = await page.evaluate(({ rootSelector, linkSelector }) => {
+      const headers = [...document.querySelectorAll(`:is(${rootSelector}) .__chat-group-header`)].map(node => node.textContent?.trim() ?? '');
+      const anchors = [...document.querySelectorAll(linkSelector)].slice(0, 12).map(node => node.textContent?.trim() ?? '');
       return {
+        conversationCount: document.querySelectorAll(linkSelector).length,
         headerCount: headers.length,
         headers,
         sampleAnchors: anchors
       };
-    });
+    }, { rootSelector: HISTORY_ROOT_SELECTOR, linkSelector: HISTORY_LINK_SELECTOR });
 
     const screenshotPath = path.join(ARTIFACTS_DIR, 'date-grouping-verification.png');
     const reportPath = path.join(ARTIFACTS_DIR, 'date-grouping-verification.json');
@@ -138,6 +104,9 @@ async function main() {
     console.log(`Verification report: ${reportPath}`);
     console.log(`Header count: ${verification.headerCount}`);
     console.log(`Headers: ${verification.headers.join(', ')}`);
+    if (verification.conversationCount === 0 || verification.headerCount === 0) {
+      throw new Error('未找到会话或日期分组，详情见验证报告。');
+    }
   } finally {
     await context.close();
     await browser.close();

@@ -83,6 +83,7 @@ async function createHarness({
       this.className = '';
       this.style = new FakeStyle();
       this.parentNode = null;
+      this.parentElement = null;
     }
 
     matches(selector) {
@@ -106,6 +107,7 @@ async function createHarness({
       super('A');
       this.conversationId = conversationId;
       this.row = row;
+      this.parentElement = row;
       this.titleElement = new FakeHTMLElement('SPAN');
     }
 
@@ -133,6 +135,7 @@ async function createHarness({
   function addVisibleConversation(conversationId) {
     const row = new FakeHTMLElement('LI');
     row.parentNode = container;
+    row.parentElement = container;
     anchors.push(new FakeHTMLAnchorElement(conversationId, row));
   }
 
@@ -140,7 +143,7 @@ async function createHarness({
 
   const historyRoot = new FakeHTMLElement('DIV');
   historyRoot.querySelector = selector => {
-    if (selector === 'ul') return container;
+    if (selector === '[role="list"], ul, ol') return container;
     if (selector.includes('/c/')) return anchors[0] || null;
     return null;
   };
@@ -206,7 +209,7 @@ async function createHarness({
   const document = {
     body: new FakeHTMLElement('BODY'),
     hidden: false,
-    querySelector: selector => selector === '#history' ? historyRoot : null,
+    querySelectorAll: selector => selector.includes('#history') ? [historyRoot] : [],
     createElement: tagName => new FakeHTMLElement(String(tagName).toUpperCase()),
     addEventListener: (name, listener) => {
       const listeners = documentListeners.get(name) || [];
