@@ -10,6 +10,10 @@ import { JSDOM } from 'jsdom';
 const source = await fs.readFile(new URL('../ChatGPT Bring Back Date Grouping.user.js', import.meta.url), 'utf8');
 const cacheKey = 'cache/test-user/test-workspace/conversation-history';
 
+test('Installable userscript remains ASCII-only for text import across devices', () => {
+  assert.match(source, /^[\x00-\x7f]*$/);
+});
+
 /** 复现拖拽行、动画容器、标题链接和操作按钮的真实层级。 */
 function conversationRow(id) {
   return `<div role="listitem" data-sidebar-chatgpt-conversation-key="chatgpt:conversation:${id}">
@@ -175,4 +179,45 @@ test('原有 #history 列表仍使用 li 标题', async t => {
   await page.settle();
   assert.deepEqual(labels(page.document), ['今天']);
   assert.equal(page.document.querySelector('.__chat-group-header').tagName, 'LI');
+});
+
+test('Older rows added to Recents render month and year groups beyond two months', async t => {
+  const now = new Date();
+  // The first day of each month keeps these fixtures outside the day/week groups.
+  const months = [2, 3, 4, 5, 6, 7, 12, 24];
+  const items = months.map(month => ({
+    id: `month-${month}`,
+    update_time: new Date(now.getFullYear(), now.getMonth() - month, 1, 12).toISOString()
+  }));
+  const page = createPage(t, section('Recents', [items[0].id]), items);
+  await page.settle();
+  assert.deepEqual(labels(page.document), ['2个月前']);
+
+  // Reproduce additional history rows mounting as the user scrolls the sidebar.
+  const list = page.document.querySelector('[role="list"]');
+  list.insertAdjacentHTML('beforeend', items.slice(1).map(item => conversationRow(item.id)).join(''));
+  await page.settle();
+  assert.deepEqual(labels(list), ['2个月前', '3个月前', '4个月前', '5个月前', '6个月前', '半年前', '1年前', '2年前']);
+  assert.equal(page.requests.length, 0, 'Cached timestamps should be sufficient for every date group');
+});
+
+test('Project conversation links in Recents retain month/year groups and survive URL changes', async t => {
+  const now = new Date();
+  const items = [2, 6, 12, 24].map(month => ({
+    id: `month-${month}`,
+    update_time: new Date(now.getFullYear(), now.getMonth() - month, 1, 12).toISOString()
+  }));
+  const html = section('Recents', items.map(item => item.id))
+    .replace('href="/c/month-6"', 'href="/g/g-p-example/c/month-6"')
+    .replace('href="/c/month-12"', 'href="https://chatgpt.com/g/g-p-example/c/month-12?view=chat#latest"')
+    .replace('href="/c/month-24"', 'href="/g/g-example/c/month-24"');
+  const page = createPage(t, html + section('Projects', ['month-12']), items);
+  await page.settle();
+  assert.deepEqual(labels(page.document), ['2个月前', '6个月前', '1年前', '2年前']);
+  const links = page.document.querySelectorAll('section:first-child a');
+  links[1].setAttribute('href', '/c/month-6');
+  links[0].setAttribute('href', '/g/g-p-example/c/month-2');
+  await page.settle();
+  assert.deepEqual(labels(page.document), ['2个月前', '6个月前', '1年前', '2年前']);
+  assert.equal(page.requests.length, 0, 'Project URLs must resolve to the same cached conversation IDs');
 });
