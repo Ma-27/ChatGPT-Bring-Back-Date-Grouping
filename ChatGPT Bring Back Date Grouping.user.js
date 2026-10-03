@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name        ChatGPT bring back date grouping
-// @version     2.5.7
+// @version     2.5.8
 // @author      tiramifue
 // @description Brings back the date grouping on chatgpt.com
 // @match       https://chatgpt.com/*
 // @run-at      document-end
 // @namespace   https://greasyfork.org/users/570213
 // @license     Apache-2.0
-// @grant       GM_addStyle
+// @grant       none
+// @sandbox     raw
 // @noframes
 // @downloadURL https://update.greasyfork.org/scripts/538829/ChatGPT%20bring%20back%20date%20grouping.user.js
 // @updateURL https://update.greasyfork.org/scripts/538829/ChatGPT%20bring%20back%20date%20grouping.meta.js
@@ -22,11 +23,11 @@
     const HISTORY_ROOT_SELECTOR = '#history, [data-app-action-sidebar-section-heading="Recents"]';
     const CONVERSATION_SELECTOR = 'a[href*="/c/"]';
     const HEADER_SELECTOR = '.__chat-group-header';
-    const HISTORY_CACHE_NAME = 'conversation-history';
-    const CACHE_POLL_INTERVAL_MS = 1000;
-    const API_PAGE_LIMIT = 50;
+    const METADATA_POLL_INTERVAL_MS = 1000;
 
-    GM_addStyle(`
+    // Page context is required to read the same committed React data as the sidebar.
+    const style = document.createElement('style');
+    style.textContent = `
 .__chat-group-header {
     list-style: none;
     padding: 6px 10px 4px;
@@ -37,7 +38,8 @@
     user-select: none;
     pointer-events: none;
 }
-    `);
+    `;
+    document.head.append(style);
 
     /**
      * Map an ISO timestamp to a Chinese date-group label.
@@ -85,274 +87,46 @@
     }
 
     /**
-     * Identify ChatGPT conversation-history keys in localStorage.
-     * Keys may have a user/workspace prefix, so match the final path segment as well.
-     * @param {string} storageKey Storage key
-     * @returns {boolean} Whether the key contains conversation history
+     * Index the committed React conversations belonging to these mounted links.
+     * DOM fibers can point to either tree. Collect both ancestor paths, then walk
+     * only their committed branches from FiberRoot.current. Shared paths are visited
+     * once; unrelated subtrees (including message bodies) are never traversed.
+     * @param {Array<HTMLAnchorElement>} nodes Mounted conversation links
+     * @returns {Map<string, object>} Conversation metadata indexed by ID
      */
-    function isConversationHistoryCacheKey(storageKey) {
-        return storageKey === HISTORY_CACHE_NAME || storageKey.endsWith(`/${HISTORY_CACHE_NAME}`);
-    }
+    function loadConversationIndex(nodes) {
+        const idsByNode = new Map(nodes.map(node => [node, getConversationIdFromNode(node)]));
+        const paths = new Set();
+        const roots = new Set();
+        const pending = nodes.map(node => {
+            const key = Object.keys(node).find(key => key.startsWith('__reactFiber$'));
+            return key ? node[key] : null;
+        });
 
-    /**
-     * Compute a lightweight stable hash to detect changes in cached content.
-     * @param {string} value Raw string
-     * @returns {string} Base-36 hash
-     */
-    function hashString(value) {
-        let hash = 2166136261;
-        for (let index = 0; index < value.length; index += 1) {
-            hash ^= value.charCodeAt(index);
-            hash = Math.imul(hash, 16777619);
-        }
-        return (hash >>> 0).toString(36);
-    }
-
-    /**
-     * Build a content signature for all conversation-history caches.
-     * The Tampermonkey sandbox may not intercept page-context setItem calls;
-     * polling the signature detects those updates.
-     * @returns {string} Current history-cache signature
-     */
-    function buildHistoryCacheSignature() {
-        const signatures = [];
-
-        for (let index = 0; index < localStorage.length; index += 1) {
-            const storageKey = localStorage.key(index);
-            if (!storageKey || !isConversationHistoryCacheKey(storageKey)) continue;
-
-            const rawValue = localStorage.getItem(storageKey) || '';
-            signatures.push(`${storageKey}:${rawValue.length}:${hashString(rawValue)}`);
+        while (pending.length > 0) {
+            const fiber = pending.pop();
+            if (!fiber || paths.has(fiber)) continue;
+            paths.add(fiber);
+            if (fiber.return) pending.push(fiber.return);
+            else if (fiber.stateNode?.current) roots.add(fiber.stateNode.current);
+            if (fiber.alternate) pending.push(fiber.alternate);
         }
 
-        return signatures.sort().join('|');
-    }
+        const conversationIndex = new Map();
+        const branches = [...roots].map(fiber => ({ fiber, conversation: null }));
+        while (branches.length > 0) {
+            const branch = branches.pop();
+            const { fiber } = branch;
+            const conversation = fiber.memoizedProps?.conversation || branch.conversation;
+            const id = idsByNode.get(fiber.stateNode);
+            if (id && conversation?.id === id) conversationIndex.set(id, conversation);
 
-    /**
-     * Extract pages from a TanStack Query-style paginated cache.
-     * Accept only the explicit pages/items structure to exclude unrelated caches.
-     * @param {object} payload Parsed cache entry
-     * @returns {Array<object>} Cached pages
-     */
-    function getHistoryPages(payload) {
-        if (Array.isArray(payload?.value?.pages)) return payload.value.pages;
-        if (Array.isArray(payload?.pages)) return payload.pages;
-        return [];
-    }
-
-    /**
-     * Extract conversations from a paginated or flat cache.
-     * @param {object} payload Parsed cache entry
-     * @returns {Array<object>} Conversation entries
-     */
-    function getHistoryItems(payload) {
-        const pages = getHistoryPages(payload);
-        if (pages.length > 0) {
-            return pages.flatMap(page => Array.isArray(page?.items) ? page.items : []);
-        }
-
-        if (Array.isArray(payload?.value?.items)) return payload.value.items;
-        if (Array.isArray(payload?.items)) return payload.items;
-        return [];
-    }
-
-    /**
-     * Insert a conversation into the index.
-     * For duplicate IDs, keep the entry with the most recent update time.
-     * @param {Map<string, object>} conversationIndex Conversation index
-     * @param {object} item Conversation entry
-     */
-    function upsertConversationIndex(conversationIndex, item) {
-        if (!item?.id || !item?.update_time || item?.is_archived) return;
-
-        const previous = conversationIndex.get(item.id);
-        if (!previous) {
-            conversationIndex.set(item.id, item);
-            return;
-        }
-
-        const previousTime = new Date(previous.update_time).getTime();
-        const nextTime = new Date(item.update_time).getTime();
-        if (nextTime > previousTime) {
-            conversationIndex.set(item.id, item);
-        }
-    }
-
-    /**
-     * Parse a single localStorage entry.
-     * ChatGPT stores paginated history under the conversation-history key.
-     * @param {string|null} rawValue Raw cached string
-     * @returns {Array<object>} Conversation entries
-     */
-    function parseConversationHistoryEntry(rawValue) {
-        if (!rawValue) return [];
-
-        try {
-            const payload = JSON.parse(rawValue);
-            return getHistoryItems(payload);
-        } catch (error) {
-            console.warn('ChatGPT grouping: failed to parse conversation history cache.', error);
-            return [];
-        }
-    }
-
-    /**
-     * Index visible workspace/account history caches by conversation ID.
-     * For conversations in multiple caches, keep the most recent update.
-     * @returns {{conversationIndex: Map<string, object>, cacheRevision: string}} Index and cache revision
-     */
-    function loadConversationIndex() {
-        const conversationIndex = new Map(apiConversationIndex);
-        const cacheSignatures = [];
-
-        for (let index = 0; index < localStorage.length; index += 1) {
-            const storageKey = localStorage.key(index);
-            if (!storageKey || !isConversationHistoryCacheKey(storageKey)) continue;
-
-            const rawValue = localStorage.getItem(storageKey) || '';
-            cacheSignatures.push(`${storageKey}:${rawValue.length}:${hashString(rawValue)}`);
-
-            const items = parseConversationHistoryEntry(rawValue);
-            for (const item of items) {
-                upsertConversationIndex(conversationIndex, item);
+            // Follow current child/sibling edges, never the possibly stale return chain.
+            for (let child = fiber.child; child; child = child.sibling) {
+                if (paths.has(child)) branches.push({ fiber: child, conversation });
             }
         }
-
-        return {
-            conversationIndex,
-            cacheRevision: cacheSignatures.sort().join('|')
-        };
-    }
-
-    const apiConversationIndex = new Map();
-    let apiFetchInFlight = false;
-    let activeApiCatalogState = null;
-
-    /**
-     * Create API catalog scan state for a specific history-cache revision.
-     * Read pages and attempted IDs belong to this revision; a cache change resets the state.
-     * @param {string} cacheRevision History-cache revision
-     * @returns {object} API catalog scan state
-     */
-    function createApiCatalogState(cacheRevision) {
-        return {
-            cacheRevision,
-            nextOffset: 0,
-            total: Infinity,
-            exhausted: false,
-            attemptedConversationIds: new Set(),
-            pendingConversationIds: new Set()
-        };
-    }
-
-    /**
-     * Get the API catalog scan state for the current cache revision.
-     * @param {string} cacheRevision History-cache revision
-     * @returns {object} API catalog scan state
-     */
-    function getApiCatalogState(cacheRevision) {
-        if (!activeApiCatalogState || activeApiCatalogState.cacheRevision !== cacheRevision) {
-            activeApiCatalogState = createApiCatalogState(cacheRevision);
-        }
-        return activeApiCatalogState;
-    }
-
-    /**
-     * Fetch missing metadata for visible conversations from the history API.
-     * Within a cache revision, resume at the last successful offset without rescanning pages.
-     * @param {Set<string>} targetIds Visible conversation IDs missing timestamps
-     * @param {object} catalogState API catalog scan state for this cache revision
-     */
-    async function fetchMissingConversationMetadata(targetIds, catalogState) {
-        let hasNewMetadata = false;
-
-        while (targetIds.size > 0 && !catalogState.exhausted) {
-            const offset = catalogState.nextOffset;
-            const apiUrl = new URL('/backend-api/conversations', location.origin);
-            apiUrl.searchParams.set('offset', String(offset));
-            apiUrl.searchParams.set('limit', String(API_PAGE_LIMIT));
-            apiUrl.searchParams.set('order', 'updated');
-            apiUrl.searchParams.set('is_archived', 'false');
-            apiUrl.searchParams.set('is_starred', 'false');
-
-            const response = await fetch(apiUrl.toString(), {
-                credentials: 'include'
-            });
-            if (!response.ok) {
-                throw new Error(`history api returned ${response.status}`);
-            }
-
-            const payload = await response.json();
-            const items = Array.isArray(payload?.items) ? payload.items : [];
-            if (Number.isFinite(payload?.total)) {
-                catalogState.total = payload.total;
-            }
-
-            for (const item of items) {
-                const before = apiConversationIndex.get(item?.id);
-                upsertConversationIndex(apiConversationIndex, item);
-                const after = apiConversationIndex.get(item?.id);
-                if (after && after !== before) hasNewMetadata = true;
-                if (item?.id) targetIds.delete(item.id);
-            }
-
-            // Advance only after parsing the current page; a network failure must not skip unread entries.
-            catalogState.nextOffset = offset + items.length;
-            catalogState.exhausted = items.length === 0 || catalogState.nextOffset >= catalogState.total;
-        }
-
-        if (hasNewMetadata) queueRender();
-    }
-
-    /**
-     * Process pending conversation IDs for the current cache revision in sequence.
-     * Deduplicate requests in a set and process newly queued IDs after the current fetch.
-     */
-    function processPendingConversationMetadata() {
-        if (apiFetchInFlight || !activeApiCatalogState) return;
-
-        const catalogState = activeApiCatalogState;
-        const targetIds = new Set(
-            [...catalogState.pendingConversationIds].filter(id => !apiConversationIndex.has(id))
-        );
-        catalogState.pendingConversationIds.clear();
-
-        if (targetIds.size === 0 || catalogState.exhausted) return;
-
-        apiFetchInFlight = true;
-        fetchMissingConversationMetadata(targetIds, catalogState)
-            .catch(error => {
-                console.warn('ChatGPT grouping: failed to fetch conversation metadata.', error);
-            })
-            .finally(() => {
-                apiFetchInFlight = false;
-                processPendingConversationMetadata();
-            });
-    }
-
-    /**
-     * Request missing conversation metadata from the API.
-     * Each missing ID enters the scan at most once per cache revision.
-     * @param {Array<string>} missingConversationIds Visible IDs missing timestamps
-     * @param {string} cacheRevision History-cache revision
-     */
-    function requestMissingConversationMetadata(missingConversationIds, cacheRevision) {
-        const catalogState = getApiCatalogState(cacheRevision);
-
-        for (const conversationId of missingConversationIds) {
-            if (
-                !conversationId ||
-                apiConversationIndex.has(conversationId) ||
-                catalogState.attemptedConversationIds.has(conversationId)
-            ) {
-                continue;
-            }
-
-            catalogState.attemptedConversationIds.add(conversationId);
-            catalogState.pendingConversationIds.add(conversationId);
-        }
-
-        processPendingConversationMetadata();
+        return conversationIndex;
     }
 
     /**
@@ -427,7 +201,7 @@
 
     /**
      * Rebuild group headers in the current DOM order.
-     * The page owns sorting; cached update_time values determine group boundaries.
+     * The page owns sorting; committed update_time values determine group boundaries.
      * @param {HTMLElement} historyRoot History section root
      */
     function renderGroupedChats(historyRoot) {
@@ -436,25 +210,21 @@
         isRendering = true;
 
         try {
-            clearGroupedChats(historyRoot);
-
             const container = getRenderableHistoryContainer(historyRoot);
             if (!(container instanceof HTMLElement)) return;
 
-            syncGroupHeaderPadding(historyRoot, container);
-
-            const { conversationIndex, cacheRevision } = loadConversationIndex();
+            const nodes = [...container.querySelectorAll(CONVERSATION_SELECTOR)];
+            const conversationIndex = loadConversationIndex(nodes);
+            const groups = [];
             let lastLabel = null;
-            const missingConversationIds = [];
 
-            container.querySelectorAll(CONVERSATION_SELECTOR).forEach(node => {
+            nodes.forEach(node => {
                 const conversationId = getConversationIdFromNode(node);
                 const conversation = conversationId ? conversationIndex.get(conversationId) : null;
                 const label = getDateGroupLabel(conversation?.update_time || null);
 
-                // Skip entries without a cached timestamp instead of guessing their date group.
+                // An absent timestamp is not evidence of a date; wait for committed metadata.
                 if (!label) {
-                    if (conversationId) missingConversationIds.push(conversationId);
                     // An unknown timestamp breaks the group; the next known entry needs a new header.
                     lastLabel = null;
                     return;
@@ -463,14 +233,23 @@
                 if (label !== lastLabel) {
                     const row = getConversationRow(node, container);
                     if (row) {
-                        row.parentNode.insertBefore(createGroupHeader(container, label), row);
+                        groups.push({ row, label });
                         lastLabel = label;
                     }
                 }
             });
 
-            if (missingConversationIds.length > 0) {
-                requestMissingConversationMetadata(missingConversationIds, cacheRevision);
+            // Polling must not rewrite unchanged headers or disturb scroll anchoring.
+            const headers = [...historyRoot.querySelectorAll(HEADER_SELECTOR)];
+            const unchanged = headers.length === groups.length && groups.every((group, index) => (
+                headers[index].textContent === group.label && headers[index].nextElementSibling === group.row
+            ));
+            if (unchanged) return;
+
+            clearGroupedChats(historyRoot);
+            syncGroupHeaderPadding(historyRoot, container);
+            for (const { row, label } of groups) {
+                container.insertBefore(createGroupHeader(container, label), row);
             }
         } finally {
             isRendering = false;
@@ -529,59 +308,13 @@
     }
 
     /**
-     * Listen for conversation-history updates in localStorage.
-     * Same-page writes do not emit storage events, so also intercept Storage prototype methods.
+     * A React prop update need not mutate a row's DOM. Check committed metadata
+     * while visible, coalescing with DOM signals and leaving unchanged headers intact.
      */
-    function installHistoryCacheListeners() {
-        window.addEventListener('storage', event => {
-            if (typeof event.key === 'string' && isConversationHistoryCacheKey(event.key)) {
-                queueRender();
-            }
-        });
-
-        if (Storage.prototype.__chatGroupingPatched) return;
-
-        const originalSetItem = Storage.prototype.setItem;
-        const originalRemoveItem = Storage.prototype.removeItem;
-
-        Storage.prototype.setItem = function (key, value) {
-            const result = originalSetItem.apply(this, arguments);
-            if (this === localStorage && typeof key === 'string' && isConversationHistoryCacheKey(key)) {
-                queueRender();
-            }
-            return result;
-        };
-
-        Storage.prototype.removeItem = function (key) {
-            const result = originalRemoveItem.apply(this, arguments);
-            if (this === localStorage && typeof key === 'string' && isConversationHistoryCacheKey(key)) {
-                queueRender();
-            }
-            return result;
-        };
-
-        Storage.prototype.__chatGroupingPatched = true;
-    }
-
-    /**
-     * Poll for history-cache changes at a low frequency.
-     * This covers page writes that the Tampermonkey sandbox cannot intercept.
-     */
-    function startHistoryCachePolling() {
-        let lastSignature = buildHistoryCacheSignature();
-
-        function checkHistoryCache() {
-            if (document.hidden) return;
-
-            const nextSignature = buildHistoryCacheSignature();
-            if (nextSignature === lastSignature) return;
-
-            lastSignature = nextSignature;
-            queueRender();
-        }
-
-        window.setTimeout(checkHistoryCache, Math.floor(CACHE_POLL_INTERVAL_MS / 2));
-        window.setInterval(checkHistoryCache, CACHE_POLL_INTERVAL_MS);
+    function startMetadataPolling() {
+        window.setInterval(() => {
+            if (!document.hidden) queueRender();
+        }, METADATA_POLL_INTERVAL_MS);
     }
 
     /**
@@ -621,8 +354,7 @@
             }
         }
 
-        installHistoryCacheListeners();
-        startHistoryCachePolling();
+        startMetadataPolling();
         scheduleMidnightRefresh();
 
         const rootObserver = new MutationObserver(mutations => {

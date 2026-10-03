@@ -41,20 +41,6 @@ async function loadRecentChatUrl() {
   return stdout.trim();
 }
 
-/**
- * 注入 userscript 所需的最小 GM API。
- * @param {import('playwright-core').Page} page 页面对象
- */
-async function installUserScriptShim(page) {
-  await page.addInitScript(() => {
-    window.GM_addStyle = cssText => {
-      const style = document.createElement('style');
-      style.textContent = String(cssText);
-      document.head.appendChild(style);
-    };
-  });
-}
-
 async function main() {
   await fs.mkdir(ARTIFACTS_DIR, { recursive: true });
 
@@ -72,7 +58,6 @@ async function main() {
     await context.addCookies(cookies);
 
     const page = await context.newPage();
-    await installUserScriptShim(page);
 
     await page.goto(recentChatUrl, { waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(4000);

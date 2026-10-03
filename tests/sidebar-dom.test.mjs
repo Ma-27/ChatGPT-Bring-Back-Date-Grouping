@@ -5,104 +5,15 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import test from 'node:test';
-import { JSDOM } from 'jsdom';
+import { conversationRow, section, conversation, createPage, labels } from './helpers/sidebar-page.mjs';
 
 const source = await fs.readFile(new URL('../ChatGPT Bring Back Date Grouping.user.js', import.meta.url), 'utf8');
-const cacheKey = 'cache/test-user/test-workspace/conversation-history';
 
-test('Installable userscript remains ASCII-only for text import across devices', () => {
+test('Installable userscript remains ASCII-only and requires page context', () => {
   assert.match(source, /^[\x00-\x7f]*$/);
+  assert.match(source, /@grant\s+none/);
+  assert.match(source, /@sandbox\s+raw/);
 });
-
-/** 复现拖拽行、动画容器、标题链接和操作按钮的真实层级。 */
-function conversationRow(id) {
-  return `<div role="listitem" data-sidebar-chatgpt-conversation-key="chatgpt:conversation:${id}">
-    <div class="overflow-hidden"><div role="group" class="sidebar-item">
-      <div><div><div data-thread-title-trigger="true">
-        <a href="/c/${id}" data-interactive-row-link="true"><span data-thread-title="true">${id}</span></a>
-      </div></div></div><div><button>聊天操作</button><button>置顶聊天</button></div>
-    </div></div>
-  </div>`;
-}
-
-/** 各个区域共用行结构，只有 Recents 应当插入日期标题。 */
-function section(name, ids) {
-  return `<section data-app-action-sidebar-section-heading="${name}">
-    <div><div>区域标题</div><div aria-hidden="false"><div class="overflow-hidden">
-      <div data-appearance="plain"><div role="list">${ids.map(conversationRow).join('')}</div></div>
-    </div></div></div>
-  </section>`;
-}
-
-/** 使用本地日历时间构造数据，使断言不依赖执行测试的日期和时区。 */
-function conversation(id, daysAgo = 0) {
-  const date = new Date();
-  date.setHours(12, 0, 0, 0);
-  date.setDate(date.getDate() - daysAgo);
-  return { id, update_time: date.toISOString() };
-}
-
-/** 提供真实 MutationObserver、可控帧调度和隔离的元数据响应。 */
-function createPage(t, html, items) {
-  const dom = new JSDOM(html, { url: 'https://chatgpt.com/', runScripts: 'outside-only' });
-  const { window } = dom;
-  const observers = [];
-  // JSDOM close 会移除 document；先断开监听，避免测试清理触发页面回调。
-  const NativeMutationObserver = window.MutationObserver;
-  window.MutationObserver = class extends NativeMutationObserver {
-    constructor(callback) {
-      super(callback);
-      observers.push(this);
-    }
-  };
-  t.after(() => {
-    observers.forEach(observer => observer.disconnect());
-    window.close();
-  });
-  const frames = [];
-  const requests = [];
-  const warnings = [];
-  window.addEventListener('error', event => warnings.push(event.error));
-  window.requestAnimationFrame = callback => frames.push(callback);
-  window.GM_addStyle = () => {};
-  window.console.log = () => {};
-  window.console.warn = (...args) => warnings.push(args);
-  window.fetch = async url => {
-    requests.push(url);
-    return { ok: true, json: async () => ({ items: [], total: 0 }) };
-  };
-  function updateCache(nextItems) {
-    window.localStorage.setItem(cacheKey, JSON.stringify({ value: { pages: [{ items: nextItems }] } }));
-  }
-  updateCache(items);
-  window.eval(source);
-  return {
-    document: window.document,
-    window,
-    requests,
-    updateCache,
-    // 刷新至稳定状态；脚本自身的 DOM 变化若形成循环，测试会明确失败。
-    async settle() {
-      for (let attempt = 0; attempt < 10; attempt += 1) {
-        await new Promise(resolve => setImmediate(resolve));
-        if (!frames.length) {
-          assert.equal(warnings.length, 0, '执行过程中不应产生脚本错误');
-          return;
-        }
-        frames.splice(0).forEach(callback => callback());
-      }
-      assert.fail('分组渲染没有收敛，可能存在 MutationObserver 自触发循环');
-    }
-  };
-}
-
-/** 同时检查标题顺序及其父节点，防止标题被错误地插入链接或按钮容器。 */
-function labels(root) {
-  return [...root.querySelectorAll('.__chat-group-header')].map(header => {
-    assert.ok(header.parentElement.matches('[role="list"], ul, ol'));
-    return header.textContent;
-  });
-}
 
 test('新版 Recents：整行分组，不改动置顶、项目、聊天正文或原有行', async t => {
   const html = section('Pinned', ['pinned']) + section('Projects', ['project'])
@@ -161,15 +72,17 @@ test('侧栏延迟挂载、多实例、卸载重建及同一节点重新挂载',
   assert.equal(page.document.querySelectorAll('.__chat-group-header').length, 2);
 });
 
-test('未知元数据不猜日期，缓存补齐后自动更新且不重复插入', async t => {
+test('未知元数据不猜日期，React 提交后自动更新且不重复插入', async t => {
   const page = createPage(t, section('Recents', ['today', 'missing', 'today-again']), [conversation('today'), conversation('today-again')]);
   await page.settle();
   assert.deepEqual(labels(page.document), ['今天', '今天']);
-  assert.equal(page.requests.length, 1);
-  page.updateCache([conversation('today'), conversation('missing', 1), conversation('today-again')]);
+  assert.equal(page.requests.length, 0);
+  page.commit([conversation('today'), conversation('missing', 1), conversation('today-again')]);
+  page.poll();
   await page.settle();
   assert.deepEqual(labels(page.document), ['今天', '昨天', '今天']);
   for (let i = 0; i < 20; i += 1) page.window.dispatchEvent(new page.window.Event('focus'));
+  page.poll();
   await page.settle();
   assert.deepEqual(labels(page.document), ['今天', '昨天', '今天']);
 });
@@ -198,7 +111,7 @@ test('Older rows added to Recents render month and year groups beyond two months
   list.insertAdjacentHTML('beforeend', items.slice(1).map(item => conversationRow(item.id)).join(''));
   await page.settle();
   assert.deepEqual(labels(list), ['2个月前', '3个月前', '4个月前', '5个月前', '6个月前', '半年前', '1年前', '2年前']);
-  assert.equal(page.requests.length, 0, 'Cached timestamps should be sufficient for every date group');
+  assert.equal(page.requests.length, 0, 'Committed timestamps should cover every date group');
 });
 
 test('Project conversation links in Recents retain month/year groups and survive URL changes', async t => {
@@ -219,5 +132,5 @@ test('Project conversation links in Recents retain month/year groups and survive
   links[0].setAttribute('href', '/g/g-p-example/c/month-2');
   await page.settle();
   assert.deepEqual(labels(page.document), ['2个月前', '6个月前', '1年前', '2年前']);
-  assert.equal(page.requests.length, 0, 'Project URLs must resolve to the same cached conversation IDs');
+  assert.equal(page.requests.length, 0, 'Project URLs must resolve to the same committed conversation IDs');
 });
